@@ -1,0 +1,367 @@
+# Unit tests for the System overview queries of SystemMetrics.java.
+# Run: ./mvnw -pl demo-gateway test (PromqlRegressionTest runs promtool; see docs/guides/testing.md).
+# SystemMetricsTest checks that these expr values are the gateway's queries.
+evaluation_interval: 5s
+
+tests:
+  # Partition 0 has lag 100, partition 2 lag 50, partition 1 never committed (offset and lag -1) but holds 400 events.
+  - name: backlog adds the events of a never-committed partition and ignores -1
+    interval: 5s
+    input_series:
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="0"}'
+        values: '100x12'
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="1"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="2"}'
+        values: '50x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="0"}'
+        values: '900x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="1"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="2"}'
+        values: '750x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="0"}'
+        values: '1000x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="0"}'
+        values: '0x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="1"}'
+        values: '500x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="1"}'
+        values: '100x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="2"}'
+        values: '800x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="2"}'
+        values: '0x12'
+    promql_expr_test:
+      - expr: 'sum(clamp_min(kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1"}, 0)) + (sum((kafka_topic_partition_current_offset{topic="events.v1"} - kafka_topic_partition_oldest_offset{topic="events.v1"}) and on(topic, partition) (kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1"} == -1)) or vector(0))'
+        eval_time: 30s
+        exp_samples:
+          - labels: '{}'
+            value: 550
+
+  # What kafka-exporter v1.11.0 exports for a group that committed only partition 0 (offset 1 of 2 records), checked
+  # against a real broker: the other partitions report offset -1 and lag -1, the topic offsets are the log ends.
+  - name: backlog for a group that committed only one partition, as the exporter reports it
+    interval: 5s
+    input_series:
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="0"}'
+        values: '1x12'
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="1"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="2"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="0"}'
+        values: '1x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="1"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="2"}'
+        values: '-1x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="0"}'
+        values: '2x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="1"}'
+        values: '3x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="2"}'
+        values: '5x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="0"}'
+        values: '0x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="1"}'
+        values: '0x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="2"}'
+        values: '0x12'
+    promql_expr_test:
+      - expr: 'sum(clamp_min(kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1"}, 0)) + (sum((kafka_topic_partition_current_offset{topic="events.v1"} - kafka_topic_partition_oldest_offset{topic="events.v1"}) and on(topic, partition) (kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1"} == -1)) or vector(0))'
+        eval_time: 30s
+        exp_samples:
+          - labels: '{}'
+            value: 9
+
+  # kafka-exporter skips a topic for a group without any commit, so the group has no series at all: unknown, not 0.
+  - name: backlog is unknown when the group has no committed offset anywhere
+    interval: 5s
+    input_series:
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="0"}'
+        values: '300x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="0"}'
+        values: '0x12'
+    promql_expr_test:
+      - expr: 'sum(clamp_min(kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1"}, 0)) + (sum((kafka_topic_partition_current_offset{topic="events.v1"} - kafka_topic_partition_oldest_offset{topic="events.v1"}) and on(topic, partition) (kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1"} == -1)) or vector(0))'
+        eval_time: 30s
+        exp_samples: []
+
+  # A committed offset beyond the log end (recreated topic) gives a lag of -1 or below. It is not the "never committed"
+  # marker (that is the offset -1), so the partition counts 0, not its log.
+  - name: a negative lag with a real committed offset counts as zero
+    interval: 5s
+    input_series:
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="0"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="1"}'
+        values: '10x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="0"}'
+        values: '7x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="1"}'
+        values: '90x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="0"}'
+        values: '6x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="0"}'
+        values: '0x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="1"}'
+        values: '100x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="1"}'
+        values: '0x12'
+    promql_expr_test:
+      - expr: 'sum(clamp_min(kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1"}, 0)) + (sum((kafka_topic_partition_current_offset{topic="events.v1"} - kafka_topic_partition_oldest_offset{topic="events.v1"}) and on(topic, partition) (kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1"} == -1)) or vector(0))'
+        eval_time: 30s
+        exp_samples:
+          - labels: '{}'
+            value: 10
+
+  # The per-partition backlog of the Grafana panel and its maximum (the resilience script's "worst partition"), for the
+  # same exporter output as above: committed partition 0 has lag 1, the two uncommitted ones hold 3 and 5 events.
+  - name: the per-partition backlog and its maximum use the same sentinel
+    interval: 5s
+    input_series:
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="0"}'
+        values: '1x12'
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="1"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1",partition="2"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="0"}'
+        values: '1x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="1"}'
+        values: '-1x12'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1",partition="2"}'
+        values: '-1x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="0"}'
+        values: '2x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="1"}'
+        values: '3x12'
+      - series: 'kafka_topic_partition_current_offset{topic="events.v1",partition="2"}'
+        values: '5x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="0"}'
+        values: '0x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="1"}'
+        values: '0x12'
+      - series: 'kafka_topic_partition_oldest_offset{topic="events.v1",partition="2"}'
+        values: '0x12'
+    promql_expr_test:
+      - expr: 'kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1"} >= 0 or on(topic, partition) ((kafka_topic_partition_current_offset{topic="events.v1"} - kafka_topic_partition_oldest_offset{topic="events.v1"}) and on(topic, partition) (kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1"} == -1))'
+        eval_time: 30s
+        exp_samples:
+          - labels: '{__name__="kafka_consumergroup_lag",consumergroup="event-processor",partition="0",topic="events.v1"}'
+            value: 1
+          - labels: '{partition="1",topic="events.v1"}'
+            value: 3
+          - labels: '{partition="2",topic="events.v1"}'
+            value: 5
+      - expr: 'max(kafka_consumergroup_lag{consumergroup="event-processor",topic="events.v1"} >= 0 or on(topic, partition) ((kafka_topic_partition_current_offset{topic="events.v1"} - kafka_topic_partition_oldest_offset{topic="events.v1"}) and on(topic, partition) (kafka_consumergroup_current_offset{consumergroup="event-processor",topic="events.v1"} == -1)))'
+        eval_time: 30s
+        exp_samples:
+          - labels: '{}'
+            value: 5
+
+  # Replica a restarts at t=455 s (its counter drops to 0); the total must not go negative or lose the events.
+  # Window (300 s, 600 s]: replica a 300 + 0 + 290, replica b 60 steps of 20. Exact, no rounding.
+  - name: the ingested total survives a counter reset and adds both replicas
+    interval: 5s
+    input_series:
+      - series: 'ingestion_events_accepted_total{instance="a"}'
+        values: '0+10x90 0+10x29'
+      - series: 'ingestion_events_accepted_total{instance="b"}'
+        values: '0+20x120'
+    promql_expr_test:
+      - expr: 'sum(sum_over_time(clamp_min(ingestion_events_accepted_total - ingestion_events_accepted_total offset 5s, 0)[5m:5s])) + (sum(sum_over_time((ingestion_events_accepted_total < ingestion_events_accepted_total offset 5s)[5m:5s])) or vector(0))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1790
+
+  # A run of 15,000 events (t=355..505 s) on a counter that existed before: the total is exactly 15,000, where
+  # increase() reported 15,254 (extrapolated from the 295 s between the first and last sample to the 300 s window).
+  - name: a burst inside the window is counted exactly, not extrapolated
+    interval: 5s
+    input_series:
+      - series: 'ingestion_events_accepted_total{instance="a"}'
+        values: '1000000x70 1000000+500x30 1015000x20'
+    promql_expr_test:
+      - expr: 'sum(sum_over_time(clamp_min(ingestion_events_accepted_total - ingestion_events_accepted_total offset 5s, 0)[5m:5s])) + (sum(sum_over_time((ingestion_events_accepted_total < ingestion_events_accepted_total offset 5s)[5m:5s])) or vector(0))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 15000
+      - expr: 'round(sum(increase(ingestion_events_accepted_total[5m])))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 15254
+
+  # A burst of 500 events per 5 s ends at t=50 s: the current rate falls to 0, the chart's 15 s rate shows the burst.
+  - name: the current rate is zero after a burst while the 15 s chart rate still holds the peak
+    interval: 5s
+    input_series:
+      - series: 'ingestion_events_accepted_total{instance="a"}'
+        values: '0+500x10 5000x100'
+    promql_expr_test:
+      - expr: 'sum(rate(ingestion_events_accepted_total[30s]))'
+        eval_time: 5m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+      - expr: 'sum(rate(ingestion_events_accepted_total[15s]))'
+        eval_time: 25s
+        exp_samples:
+          - labels: '{}'
+            value: 100
+
+  # Two steps of 5,000 events (t=100 s and t=105 s) on a large counter. The chart plots the 15 s rate every 5 s, so the
+  # peak is the same wherever the dashboard's window starts; a coarser step could sample 500 only, or 0.
+  - name: the 15 s rate sampled every 5 s always contains the burst peak
+    interval: 5s
+    input_series:
+      - series: 'ingestion_events_accepted_total{instance="a"}'
+        values: '1000000x19 1005000 1010000 1010000x200'
+    promql_expr_test:
+      - expr: 'sum(rate(ingestion_events_accepted_total[15s]))'
+        eval_time: 100s
+        exp_samples:
+          - labels: '{}'
+            value: 500
+      - expr: 'sum(rate(ingestion_events_accepted_total[15s]))'
+        eval_time: 105s
+        exp_samples:
+          - labels: '{}'
+            value: 1000
+      - expr: 'sum(rate(ingestion_events_accepted_total[15s]))'
+        eval_time: 110s
+        exp_samples:
+          - labels: '{}'
+            value: 500
+
+  # The first 429s: the series is created by the first response, so increase() alone never sees the jump from "no
+  # series" to its first value. A series that already existed at the window start must not be counted again.
+  - name: a 429 series born inside the window counts its first value
+    interval: 5s
+    input_series:
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}'
+        values: '_x90 12x31'
+    promql_expr_test:
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[10m] offset 5m)) or vector(0)))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 12
+
+  - name: a 429 series born inside the window and still counting adds the first value to the increase
+    interval: 5s
+    input_series:
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}'
+        values: '_x90 12 15 20x29'
+    promql_expr_test:
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[10m] offset 5m)) or vector(0)))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 20
+
+  - name: a 429 series that existed before the window and stayed idle counts zero
+    interval: 5s
+    input_series:
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}'
+        values: '5x121'
+    promql_expr_test:
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[10m] offset 5m)) or vector(0)))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+
+  # The counter is 1000 at t=0 and 1900 at t=450, restarts at 0 at t=455 and reaches 290 at t=600. Real increments in
+  # the window: 290 (1610 -> 1900) + 290 = 580; increase() extrapolates by half a step to the window start (580 x 300/295).
+  - name: a 429 counter reset inside the window is not lost or negative
+    interval: 5s
+    input_series:
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}'
+        values: '1000+10x90 0+10x30'
+    promql_expr_test:
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[10m] offset 5m)) or vector(0)))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 590
+
+  # Instance a counted 100 at t=0 and adds 10 per step (+590 in the window, 600 after extrapolation); instance b
+  # served its first 429s at t=450 (7).
+  - name: a 429 series born on one instance is added to the increase of another
+    interval: 5s
+    input_series:
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429",instance="a"}'
+        values: '100+10x120'
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429",instance="b"}'
+        values: '_x90 7x31'
+    promql_expr_test:
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[10m] offset 5m)) or vector(0)))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 607
+
+  - name: 5xx responses of several statuses born inside the window are summed
+    interval: 5s
+    input_series:
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="500"}'
+        values: '_x90 3x31'
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="503"}'
+        values: '_x90 4x31'
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="202"}'
+        values: '_x90 900x31'
+    promql_expr_test:
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status=~"5.."}[5m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status=~"5.."}[5m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status=~"5.."}[10m] offset 5m)) or vector(0)))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 7
+
+  # The 15 minute window: the series is born at t=1000 s, the window (300 s, 1200 s] has no sample of it at its start.
+  - name: a 429 series born inside the 15 minute window counts its first value
+    interval: 5s
+    input_series:
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}'
+        values: '_x200 9x41'
+    promql_expr_test:
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[15m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[15m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[10m] offset 15m)) or vector(0)))'
+        eval_time: 20m
+        exp_samples:
+          - labels: '{}'
+            value: 9
+
+  # Neither metric has a series yet: counters registered at startup stay unknown, lazily created HTTP counters are 0.
+  - name: a missing metric is unknown, a missing HTTP status counter is zero
+    interval: 5s
+    input_series:
+      - series: 'ingestion_events_accepted_total{instance="a"}'
+        values: '0x60'
+    promql_expr_test:
+      - expr: 'sum(sum_over_time(clamp_min(processor_events_duplicate_total - processor_events_duplicate_total offset 5s, 0)[5m:5s])) + (sum(sum_over_time((processor_events_duplicate_total < processor_events_duplicate_total offset 5s)[5m:5s])) or vector(0))'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[10m] offset 5m)) or vector(0)))'
+        eval_time: 5m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+
+  # One failed scrape (stale marker) exactly at the window start: the counter existed, so its 5000 must not count as
+  # new. A plain `S offset 5m` would find no sample there and add 5000; last_over_time over the 10 m before the
+  # window start skips the stale marker (10 m = two Prometheus staleness lookbacks, 120 scrape intervals).
+  - name: a failed scrape at the window start does not make an existing 429 counter look new
+    interval: 5s
+    input_series:
+      - series: 'http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}'
+        values: '5000x59 stale 5000x100'
+    promql_expr_test:
+      - expr: 'round((sum(increase(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m])) or vector(0)) + (sum(min_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[5m]) unless last_over_time(http_server_requests_seconds_count{application="ingestion-api",uri="/v1/events",status="429"}[10m] offset 5m)) or vector(0)))'
+        eval_time: 602s
+        exp_samples:
+          - labels: '{}'
+            value: 0

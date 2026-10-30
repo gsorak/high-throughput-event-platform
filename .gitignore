@@ -1,0 +1,10 @@
+target/
+*.iml
+.idea/
+.vscode/
+.DS_Store
+load-tests/results/
+.local/
+node_modules/
+demo-ui/dist/
+!.mvn/wrapper/maven-wrapper.properties

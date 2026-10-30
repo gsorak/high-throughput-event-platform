@@ -1,0 +1,25 @@
+# Scrapes the two services on the host and the Kafka and PostgreSQL exporters. 5 s interval: short load-test runs still
+# get enough samples for rate() and histogram_quantile() over 30 s windows.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: ingestion-api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+
+  - job_name: event-processor
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8081"]
+
+  - job_name: kafka-exporter
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  # pg_up is 0 while PostgreSQL is unreachable (the exporter itself keeps running).
+  - job_name: postgres-exporter
+    static_configs:
+      - targets: ["postgres-exporter:9187"]

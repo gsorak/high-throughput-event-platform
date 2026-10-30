@@ -1,0 +1,136 @@
+# ingestion-api configuration. Every non-default value is explained; values without a comment are Spring Boot defaults
+# written out for readability. Environment variables override any key (e.g. SPRING_KAFKA_BOOTSTRAP_SERVERS).
+
+spring:
+    application:
+        name: ingestion-api
+    threads:
+        virtual:
+            # Each request blocks while waiting for Kafka acknowledgements. Virtual threads make that blocking cheap, so the
+            # Tomcat thread count does not cap concurrent requests.
+            enabled: true
+    kafka:
+        bootstrap-servers: localhost:9092
+        producer:
+            # The leader waits for all in-sync replicas before acknowledging. A 202 must mean "durably stored" (ADR-0002).
+            acks: all
+            key-serializer: org.apache.kafka.common.serialization.StringSerializer
+            # The envelope is serialized by EventEnvelopeCodec (event-contract), so Kafka only sees bytes.
+            value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+            # Baseline without compression; Stage 5 measures lz4/zstd against this.
+            compression-type: none
+            properties:
+                # Producer-side retries cannot create duplicates or reorder records within a partition.
+                enable.idempotence: true
+                # Wait up to 5 ms to fill a batch. Trades a little latency for far fewer broker requests.
+                linger.ms: 5
+                # The timing chain below keeps every failure inside ingestion.publish-timeout, so a broker outage produces a
+                # fast 503 instead of a hung request. See docs/architecture/delivery-guarantees.md.
+                # How long send() may block when topic metadata is unknown or the buffer is full (default 60 s).
+                max.block.ms: 500
+                # How long to wait for one broker response before retrying (default 30 s).
+                request.timeout.ms: 1500
+                # Upper bound for a record from send() to success or failure, including retries (default 120 s).
+                # Must be >= linger.ms + request.timeout.ms, or the producer refuses to start.
+                delivery.timeout.ms: 2000
+        template:
+            # Adds a span/timer per send. Off for now: per-batch metrics come from EventPublisher.
+            observation-enabled: false
+
+server:
+    port: 8080
+    # On SIGTERM: stop accepting connections, let in-flight requests finish (default timeout 30 s).
+    shutdown: graceful
+
+logging:
+    level:
+        # spring-kafka's default producer listener logs every failed record at ERROR with a stack trace: up to 500 per
+        # rejected batch during a broker outage. EventPublisher already logs one WARN per batch and counts failures in
+        # ingestion.publish.duration{outcome="failed"}.
+        org.springframework.kafka.support.LoggingProducerListener: off
+
+management:
+    endpoints:
+        web:
+            exposure:
+                # Stage 1 limitation: management shares the application port. A separate port comes with deployment.
+                include: health,info,prometheus
+    metrics:
+        tags:
+            application: ${spring.application.name}
+        distribution:
+            # Publish histogram buckets so Prometheus can compute any percentile across instances.
+            percentiles-histogram:
+                http.server.requests: true
+                ingestion.publish.duration: true
+                ratelimit.valkey.duration: true
+            # Valkey calls normally take well under 1 ms (the default lowest bucket) and time out after 100 ms.
+            minimum-expected-value:
+                ratelimit.valkey.duration: 100us
+            maximum-expected-value:
+                ratelimit.valkey.duration: 1s
+
+ingestion:
+    topic: events.v1
+    # Must exceed delivery.timeout.ms (2000 ms) + max.block.ms (500 ms) worst case for the slowest record.
+    publish-timeout: 2500ms
+    retry-after: 1s
+    max-request-body-size: 1MB
+    # Matches the documented acceptance window: occurredAt within the last 7 days ...
+    max-event-age: 7d
+    # ... and at most 5 minutes in the future.
+    max-clock-skew: 5m
+    # At startup, fetch the topic's metadata before accepting requests (ProducerWarmUp). Without it the first request
+    # after a start waits for that fetch and exceeds max.block.ms. If Kafka is unreachable for this long, start anyway.
+    kafka-warm-up-timeout: 10s
+    # Admission control: at most this many ingestion requests in progress per instance; more get an immediate 503.
+    # Bounds memory (each holds a body of up to 1 MB) when Kafka slows down. A healthy request takes milliseconds, so
+    # normal load stays far below this.
+    max-in-flight: 256
+
+security:
+    jwt:
+        # Written by `java scripts/DevJwt.java keys`, relative to the working directory (run the app from the repo
+        # root). Containers mount the key and set SECURITY_JWT_PUBLICKEYLOCATION.
+        public-key-location: file:.local/jwt/public.pem
+        # Tokens must carry exactly this iss and contain this aud (ADR-0013).
+        issuer: event-platform-dev
+        audience: event-platform
+
+rate-limit:
+    valkey-uri: redis://localhost:6379
+    # Valkey answers in well under a millisecond locally. A slower call fails over to the local limiter instead of
+    # delaying the request.
+    timeout: 100ms
+    # While Valkey is unavailable each instance enforces 1/expected-instances of the plan on its own (ADR-0004).
+    expected-instances: 1
+    default-plan: free
+    # Burst and daily quota must each be at least one full batch (500 events). The quota refills at 00:00 UTC.
+    plans:
+        free:
+            events-per-second: 200
+            burst: 1000
+            daily-quota: 1000000
+        pro:
+            events-per-second: 5000
+            burst: 10000
+            daily-quota: 100000000
+        # Plans of the temporary tenants of the demo gateway (demo-gateway/). demo-standard allows a run that outpaces the
+        # processor; demo-small makes RATE and QUOTA rejections visible within a few requests.
+        demo-standard:
+            events-per-second: 1000
+            burst: 2000
+            daily-quota: 60000
+        demo-small:
+            events-per-second: 100
+            burst: 500
+            daily-quota: 1000
+    # Tenant id -> plan; unlisted tenants get the first matching tenant-patterns rule, then default-plan.
+    tenants:
+        acme: pro
+    # Regular expressions matched against the whole tenant id, in order. The demo gateway issues tokens for these ids.
+    tenant-patterns:
+        - pattern: "demo-[0-9a-f]{16}-a"
+          plan: demo-standard
+        - pattern: "demo-[0-9a-f]{16}-b"
+          plan: demo-small

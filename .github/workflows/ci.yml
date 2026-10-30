@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      # Unit tests (surefire) and integration tests (failsafe). The integration tests start Kafka and
+      # PostgreSQL with Testcontainers, which uses the Docker daemon that ubuntu-latest runners provide.
+      # PromqlRegressionTest runs promtool from this image; without it the test would be skipped, so it is required.
+      - name: Pull promtool image
+        run: docker pull prom/prometheus:v3.15.1
+
+      - name: Build and test
+        env:
+          PROMTOOL_REQUIRED: 'true'
+        run: ./mvnw -B -ntp verify
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+          retention-days: 7

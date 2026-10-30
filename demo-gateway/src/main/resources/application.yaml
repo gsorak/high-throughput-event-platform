@@ -1,0 +1,55 @@
+server:
+    port: 8082
+    shutdown: graceful
+
+spring:
+    application:
+        name: demo-gateway
+    threads:
+        virtual:
+            enabled: true
+    web:
+        resources:
+            # The UI is served from demo.ui-location by UiConfiguration; no classpath static content.
+            add-mappings: false
+
+demo:
+    ingestion-url: http://localhost:8080
+    processor-url: http://localhost:8081
+    prometheus-url: http://localhost:9090
+    # Local only: Grafana is never exposed by a public deployment.
+    grafana-url: http://localhost:3000/d/overload-recovery
+    # Built UI (npm run build in demo-ui/); run the gateway from the repository root.
+    ui-location: file:demo-ui/dist/
+    # true behind HTTPS.
+    cookie-secure: false
+    backend-timeout: 5s
+    limits:
+        max-sessions: 20
+        max-sessions-per-client: 5
+        session-ttl: 15m
+        max-events-per-second: 1000
+        max-run-duration: 30s
+        max-events-per-run: 20000
+        max-events-per-session: 50000
+        drain-timeout: 120s
+    # Display values; ingestion-api enforces its rate-limit.plans for demo-<hex>-a and demo-<hex>-b.
+    tenant-a:
+        name: Tenant A
+        plan: demo-standard
+        events-per-second: 1000
+        burst: 2000
+        daily-quota: 60000
+    tenant-b:
+        name: Tenant B
+        plan: demo-small
+        events-per-second: 100
+        burst: 500
+        daily-quota: 1000
+    # Separate from the platform's settings (ADR-0015). Locally the development key pair from
+    # `java scripts/DevJwt.java keys`; a public deployment uses a dedicated demo issuer and key pair.
+    token:
+        private-key-location: file:.local/jwt/private.pem
+        issuer: event-platform-dev
+        audience: event-platform
+        ttl: 5m

@@ -1,0 +1,4 @@
+# Build context of demo-gateway/Dockerfile (the repository root): only the two build outputs it copies.
+*
+!demo-gateway/target/demo-gateway-*.jar
+!demo-ui/dist

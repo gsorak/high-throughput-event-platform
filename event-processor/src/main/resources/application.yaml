@@ -1,0 +1,112 @@
+# event-processor configuration. Every non-default value is explained; values without a comment are Spring Boot
+# defaults written out for readability. Environment variables override any key (e.g. SPRING_DATASOURCE_URL).
+
+spring:
+    application:
+        name: event-processor
+    threads:
+        virtual:
+            # Stats requests and listener containers run on virtual threads; both block on JDBC, which is cheap there.
+            enabled: true
+    datasource:
+        # Local development defaults (infra/local/compose.yaml). Not secrets; override via environment elsewhere.
+        url: jdbc:postgresql://localhost:5432/events
+        username: events
+        password: events
+        hikari:
+            # At least listener concurrency (3) + headroom for stats queries, see ADR-0006. Pool waits are visible as
+            # hikaricp_connections_pending and hikaricp_connections_acquire_seconds.
+            maximum-pool-size: 10
+    jdbc:
+        template:
+            # A slow stats query gives its connection back after 5 s instead of starving the consumers (ADR-0006).
+            query-timeout: 5s
+    flyway:
+        # Applies src/main/resources/db/migration at startup; this service owns the schema.
+        enabled: true
+    kafka:
+        bootstrap-servers: localhost:9092
+        consumer:
+            group-id: event-processor
+            # A new consumer group starts from the oldest retained record instead of only new ones.
+            auto-offset-reset: earliest
+            # Offsets are committed by the listener container after processing (ack-mode below), never on a timer.
+            enable-auto-commit: false
+            key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+            # Decoding happens in the listener (EventEnvelopeCodec), so a malformed record is an ordinary exception there
+            # rather than a failure inside the Kafka client.
+            value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+            max-poll-records: 500
+            properties:
+                # The established rebalance protocol. The newer "consumer" protocol (KIP-848) is a Stage 4 experiment.
+                group.protocol: classic
+        producer:
+            # Used only to publish failed records to the dead-letter topic, unchanged (DeadLetterRecoverer).
+            # The source offset is committed only after all in-sync replicas have the dead-letter copy.
+            acks: all
+            key-serializer: org.apache.kafka.common.serialization.StringSerializer
+            value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+            properties:
+                # A dead-letter send that cannot complete (topic missing, partition offline) fails within 15 s instead
+                # of the defaults (60 s metadata wait, 120 s delivery). The record is then tried again; its offset
+                # stays uncommitted meanwhile. delivery.timeout.ms must be at least request.timeout.ms + linger.ms.
+                max.block.ms: 5000
+                request.timeout.ms: 10000
+                delivery.timeout.ms: 15000
+        listener:
+            # The listener method receives one record per call.
+            type: single
+            # Commit the offsets of a whole poll after every record in it was processed: at-least-once with few commits.
+            ack-mode: batch
+            # Consumer threads in this instance. Each owns a subset of the topic's partitions (12 locally).
+            concurrency: 3
+            # Per-record tracing/timers off; the listener records its own metrics.
+            observation-enabled: false
+
+processor:
+    topic: events.v1
+    stats:
+        max-range: 24h
+        # 24 h = 1,440 minutes; leaves room for a few event types before results are truncated.
+        max-buckets: 5000
+    retry:
+        # Transient failures (database unreachable, timeout): 0.5 s, 1 s, 2 s, ... capped at 30 s, without limit.
+        # Unclassified failures: the same back-off, 10 retries, then the dead-letter topic.
+        initial-interval: 500ms
+        multiplier: 2.0
+        max-interval: 30s
+    dedup:
+        # Ledger rows are deleted 21 days after processing; derived from the replay policy in ADR-0005. A copy of an
+        # event that arrives later is counted again.
+        retention: 21d
+
+server:
+    port: 8081
+    shutdown: graceful
+
+security:
+    jwt:
+        # Same key, issuer and audience as ingestion-api (ADR-0013); see the comments there.
+        public-key-location: file:.local/jwt/public.pem
+        issuer: event-platform-dev
+        audience: event-platform
+
+management:
+    endpoints:
+        web:
+            exposure:
+                # Stage 1 limitation: management shares the application port.
+                include: health,info,prometheus
+    metrics:
+        tags:
+            application: ${spring.application.name}
+        distribution:
+            percentiles-histogram:
+                http.server.requests: true
+                processor.upsert.duration: true
+                processor.end.to.end.latency: true
+            # Micrometer's histogram buckets for timers stop at 30 s by default. While a backlog drains, end-to-end
+            # latency is minutes, and every such event would land in the +Inf bucket: histogram_quantile() would then
+            # report exactly 30 s. Extending the range keeps the percentiles meaningful during lag.
+            maximum-expected-value:
+                processor.end.to.end.latency: 30m

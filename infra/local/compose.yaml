@@ -1,0 +1,223 @@
+# Local infrastructure: one Kafka broker (KRaft), PostgreSQL, Valkey, Prometheus, Grafana, Kafka and PostgreSQL
+# exporters.
+# The two Spring Boot services run on the host (java -jar from the repository root, see README.md) and connect to
+# localhost:9092, localhost:5432 and localhost:6379; Prometheus reaches them through host.docker.internal.
+# Alternatively the profile "apps" runs them in containers (see the end of the services list); use one or the other.
+#
+#   docker compose -f infra/local/compose.yaml up -d
+#   docker compose -f infra/local/compose.yaml down -v     # -v also deletes the Kafka and PostgreSQL data
+name: event-platform
+
+services:
+  kafka:
+    image: apache/kafka:4.3.2
+    ports:
+      - "9092:9092"
+    environment:
+      # Single node acting as both broker and KRaft controller (no ZooKeeper).
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Fixed id (a base64-encoded UUID) for the local cluster; storage is formatted with it on first start.
+      CLUSTER_ID: s8PkvO6PRMuMdotS0OqbBw
+      # Inside the named volume, so topics survive "docker compose down" (without -v).
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Two client listeners, because a client connects to whatever address the broker *advertises*:
+      #   INTERNAL kafka:19092  for containers on the compose network (topic init, lag exporter)
+      #   EXTERNAL localhost:9092 for the applications on the host
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # Internal topics default to replication factor 3, impossible with one broker.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      # Topics are created explicitly by kafka-init; a typo in a topic name must fail, not create a new topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Start consuming immediately when the first consumer joins (default waits 3 s for more members).
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Each check starts a JVM (up to ~2.7 CPUs for a moment on the reference machine, docs/performance/
+      # 01-after-stage-4.md). Every 2 s during startup so dependants start quickly, then every 30 s.
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "kafka:19092"]
+      start_period: 60s
+      start_interval: 2s
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Creates the topics once the broker is healthy, then exits. --if-not-exists makes it safe to re-run: existing
+  # topics and their data are left unchanged.
+  kafka-init:
+    image: apache/kafka:4.3.2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        # events.v1. 12 partitions: the upper bound for consumer parallelism in one group (Stage 4 compares
+        # alternatives). Retention 7 days; ADR-0005 derives the deduplication window from this value (+ segment.ms),
+        # change both together. Segments roll daily so expired data is deleted within about a day of expiring.
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server=kafka:19092 --create --if-not-exists \
+          --topic=events.v1 --partitions=12 --replication-factor=1 \
+          --config=retention.ms=604800000 --config=segment.ms=86400000
+        # events.v1.DLT: records event-processor could not aggregate. Same partition count (a record keeps its
+        # partition number). Retention 13 days + daily segments: a record is gone at most 14 days after it was
+        # written, the DLT window in ADR-0005. Change both together.
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server=kafka:19092 --create --if-not-exists \
+          --topic=events.v1.DLT --partitions=12 --replication-factor=1 \
+          --config=retention.ms=1123200000 --config=segment.ms=86400000
+    restart: "no"
+
+  postgres:
+    image: postgres:17.11
+    ports:
+      - "5432:5432"
+    environment:
+      # Local development credentials only (matching event-processor's application.yaml).
+      POSTGRES_DB: events
+      POSTGRES_USER: events
+      POSTGRES_PASSWORD: events
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "events", "-d", "events"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Exposes consumer-group lag (kafka_consumergroup_lag) and topic offsets for Prometheus. The applications' own
+  # Kafka client metrics only show lag as seen by a running consumer; this shows it even when the processor is down.
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.11.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - --kafka.server=kafka:19092
+    ports:
+      - "9308:9308"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      # Makes host.docker.internal resolve on Linux too (Docker Desktop provides it already).
+      - "host.docker.internal:host-gateway"
+
+  # pg_up (1 = PostgreSQL answers) and basic database statistics. No depends_on: the resilience tests stop
+  # PostgreSQL, and the exporter must keep running and report pg_up 0 meanwhile.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.20.1
+    environment:
+      DATA_SOURCE_URI: postgres:5432/events?sslmode=disable
+      DATA_SOURCE_USER: events
+      DATA_SOURCE_PASS: events
+    ports:
+      - "9187:9187"
+    restart: unless-stopped
+
+  # One provisioned dashboard, "Overload and recovery" (infra/local/grafana). http://localhost:3000, anonymous
+  # read-only access; log in as admin/admin to edit. No volume: changes made in the UI are lost on recreate, the
+  # JSON file is the source.
+  grafana:
+    image: grafana/grafana:13.2.4
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  # Shared per-tenant token buckets (ADR-0014). No volume: lost buckets are recreated full.
+  valkey:
+    image: valkey/valkey:9.0.1
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Profile "apps": both services in containers, two ingestion-api replicas behind nginx on port 8080.
+  # Stop any host-run services first (same ports). Needs the jars and the JWT key:
+  #   ./mvnw package -DskipTests && java scripts/DevJwt.java keys
+  #   docker compose -f infra/local/compose.yaml --profile apps up -d --build
+  # Prometheus still scrapes host.docker.internal, so it does not see these containers.
+  ingestion-api:
+    profiles: [apps]
+    build: ../../ingestion-api
+    deploy:
+      replicas: 2
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    environment:
+      SPRING_KAFKA_BOOTSTRAPSERVERS: kafka:19092
+      RATELIMIT_VALKEYURI: redis://valkey:6379
+      RATELIMIT_EXPECTEDINSTANCES: 2
+      SECURITY_JWT_PUBLICKEYLOCATION: file:/jwt/public.pem
+    volumes:
+      - ../../.local/jwt/public.pem:/jwt/public.pem:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  nginx:
+    profiles: [apps]
+    image: nginx:1.29-alpine
+    depends_on:
+      ingestion-api:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+  event-processor:
+    profiles: [apps]
+    build: ../../event-processor
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_KAFKA_BOOTSTRAPSERVERS: kafka:19092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/events
+      SECURITY_JWT_PUBLICKEYLOCATION: file:/jwt/public.pem
+    volumes:
+      - ../../.local/jwt/public.pem:/jwt/public.pem:ro
+
+volumes:
+  kafka-data:
+  postgres-data:
+  prometheus-data:
