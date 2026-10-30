@@ -1,0 +1,57 @@
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: high-throughput-event-platform
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/event_platform}
+    username: ${DATABASE_USER:event_platform}
+    password: ${DATABASE_PASSWORD:event_platform_local}
+  sql:
+    init:
+      mode: always
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    producer:
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 120000
+    consumer:
+      group-id: event-platform
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      max-poll-records: 500
+    listener:
+      ack-mode: record
+
+app:
+  kafka:
+    topic: ${KAFKA_TOPIC:events.v1}
+    partitions: ${KAFKA_PARTITIONS:6}
+    replication-factor: ${KAFKA_REPLICATION_FACTOR:1}
+  rate-limit:
+    capacity: ${RATE_LIMIT_CAPACITY:100}
+    refill-per-second: ${RATE_LIMIT_REFILL_PER_SECOND:50}
+    key-ttl-seconds: ${RATE_LIMIT_KEY_TTL_SECONDS:60}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+  metrics:
+    tags:
+      application: ${spring.application.name}
